@@ -1,176 +1,171 @@
 import os
-import requests
 import time
-import json
+import statistics
+import requests
 
-# ==========================================
-# 1. إعدادات المسار (The Path to SpinMama)
-# ==========================================
-# George، التأكد ان المسار يطابق البيانات التي قمت بإ.getByIdها من SpinMama
-SPIN_MAMA_DOMAIN = os.getenv("SPINMAMA_DOMAIN", "https://api.spinmama.com") 
-# الملاحظة: تأكد من وجود Token الخاص بـ SpinMama إذا اقتصب المنصة
-SPIN_MAMA_TOKEN = os.getenv("SPINMAMA_TOKEN") 
+# إعدادات البوت
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DOMAIN = os.getenv("SPINMAMA_DOMAIN", "").strip().rstrip("/")
+SPIN_TOKEN = os.getenv("SPINMAMA_TOKEN", "").strip()
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
 
-if not TOKEN or not SPIN_MAMA_TOKEN:
-    print("Missing Telegram or SpinMama bot token")
-    raise SystemExit(1)
+TG = f"https://api.telegram.org/bot{TOKEN}/"
+http = requests.Session()
+history = []
 
-URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-def organize_game_data(data):
-    """
-    دالة لتنظيف وتنسيق بيانات SpinMama القادمة بشكل احترافي
-    """
-    if not data or not isinstance(data, list):
-        return []
-
-    results = []
-    for item in data:
-        # هنا نأخذ البيانات بناءً على هيكلية SpinMama的标准
-        uuid = item.get("uuid") or item.get("id")
-        game_name = item.get("game_name", "Aviator")
-        result_letter = item.get("result", item.get("outcome")) # إما win/loss أو winness
-        multiplier = float(item.get("multiplier", "2.0"))
-        balance = item.get("balance_before") # مفيد للمقارنة
-        
-        results.append({
-            "uuid": uuid,
-            "game": game_name,
-            "result": result_letter, # مثال: Win, Loss, Draw
-            "multiplier": multiplier,
-            "timestamp": item.get("created_at", item.get("time"))
-        })
-    
-    return results
-
-def broadcast_results(results, group_name="Results Stream"):
-    """
-    دالة إرسال النتائج في شكل رسالة منسقة
-    """
-    if not results:
-        return
-
-    # تحويل النتائج لخط واحد إن لم تكن كثيرة جداً
-    # في حالة النتائج الكثيرة، بعض المستخدمين يفضلون جدولاً، هنا جمعت لسهولة القراءة
-    status_map = {
-        "win": "🟢 WIN", 
-        "loss": "🔴 LOSS", 
-        "draw": "🟡 DRAW", 
-        "winnings": "💰 WIN" # بعض الألعاب تستخدم Winnings
-    }
-    
-    formatted_lines = []
-    
-    for index, res in enumerate(results):
-        status = status_map.get(res["result"], "❓")
-        formatted_lines.append(f"{index + 1}. {status} x {res['multiplier']}")
-
-    final_text = f"🎲 *Results for {group_name}*\n\n" + "\n".join(formatted_lines)
-
-    # الإرسال للجماعة
-    requests.post(
-        URL + "sendMessage",
-        json={
-            "chat_id": group_name, # هنا نستخدم اسم المستخدم إذا كان شخصاً واحداً، أو اسم الجماع
-            "text": final_text,
-            "parse_mode": "Markdown"
-        },
+def send(chat_id, text):
+    r = http.post(
+        TG + "sendMessage",
+        json={"chat_id": chat_id, "text": text},
         timeout=15
     )
+    r.raise_for_status()
 
-def main():
-    offset = 0
-    group_chat_id = os.getenv("GROUP_CHAT_ID", "-1001234567890") # تأكد من وضع ID الجماع هنا
-    
-    print("🚀 Bot started & Ready to fetch SpinMama Data")
+    if not r.json().get("ok"):
+        raise RuntimeError("Telegram sendMessage failed")
 
-    while True:
-        try:
-            # 1. جلب الرسائل من تيلغرام
-            response = requests.get(
-                URL + "getUpdates",
-                params={"offset": offset, "timeout": 30},
-                timeout=35
+
+def extract(payload):
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = next(
+            (
+                payload.get(k)
+                for k in (
+                    "results",
+                    "outcomes",
+                    "roundHistory",
+                    "history",
+                    "data"
+                )
+                if isinstance(payload.get(k), list)
+            ),
+            []
+        )
+    else:
+        items = []
+
+    out = []
+
+    for item in items:
+        raw = item
+        stamp = None
+
+        if isinstance(item, dict):
+            raw = next(
+                (
+                    item.get(k)
+                    for k in (
+                        "multiplier",
+                        "crashPoint",
+                        "result",
+                        "value",
+                        "outcome"
+                    )
+                    if item.get(k) is not None
+                ),
+                None
             )
-            response.raise_for_status()
 
-            data = response.json().get("result", [])
+            stamp = (
+                item.get("created_at")
+                or item.get("time")
+                or item.get("timestamp")
+            )
 
-            for update in data:
-                chat = update.get("chat", {})
-                message = update.get("message", {})
-                text = message.get("text", "")
-                
-                # تحديث الـ Offset لأنه الوحيد المتغير إذا كان الرسالة تأتي واحدة تلو الأخرى
-                # ملاحظة: إذا استخدمت الجماع لإرسال النتائج مرة واحدة، ستحتاج لشروط مختلفة قليلاً
-                if "update_id" in update and "message" in update:
-                    offset = update["update_id"] + 1
-                
-                if not chat or not text:
-                    continue
+        try:
+            val = float(
+                str(raw).lower().replace("x", "").strip()
+            )
 
-                # 2. منطق التحليل بناءً على النص الذي أرسل المستخدم
-                if text in ["/start", "/new_round"]: #"/new_round" مفيد إذا أردت تحديث النتائج كل جولة
-                    # إرسال ترحيب أو "بدء الجولة الحالية"
-                    broadcast_results(
-                        # هنا نرسل بيانات حديثة من SpinMama، سنضعها في متغير عالمي مثلاً
-                        [], # يمكن استبدالها بطلب API حقيقي إذا أردت التحديث التلقائي
-                        group_name=f"Game Round {chat['id']}"
-                    )
-                    
-                    reply = (
-                        "🟢 البوت حوصل لنتائج SpinMama!"
-                        f"\n📊 جاري تحليل جولة {chat['id']}..."
-                    )
-                    
-                    requests.post(
-                        URL + "sendMessage",
-                        json={
-                            "chat_id": chat["id"],
-                            "text": reply,
-                            "parse_mode": "Markdown"
-                        },
-                        timeout=15
-                    )
+            if 0.01 <= val <= 1000000:
+                out.append({
+                    "multiplier": round(val, 4),
+                    "timestamp": stamp
+                })
 
-                else:
-                    # منطق الرد العادي (إذا كان الرد على نفسه أو شيء مشابه)
-                    if text.isdigit(): # في حال أرسل المستخدم رقم دمج
-                        reply = f"New Ticket: **{text}** analyzed at SpinMama."
-                        requests.post(
-                            URL + "sendMessage",
-                            json={
-                                "chat_id": chat["id"],
-                                "text": reply,
-                                "parse_mode": "Markdown"
-                            }
-                        )
+        except (TypeError, ValueError):
+            pass
 
-                # 3. الاتصال بـ SpinMama Vector (عكس السابق - هنا البوت يستدعي النتائج)
-                if text == "/fetch": # زر خاص في التيلغرام لطلب النتائج مباشرة
-                
-                    # استدعاء API الخاص بـ SpinMama الذي حسبناه
-                    outcomes_url = f"{SPIN_MAMA_DOMAIN}/outcomes"
-                    
-                    resp = requests.get(outcomes_url, headers={
-                        "Authorization": f"Bearer {SPIN_MAMA_TOKEN}",
-                        "Accept": "application/json"
-                    }, timeout=45)
-                    
-                    if resp.status_code == 200:
-                        parsed_data = organize_game_data(resp.json())
-                        if parsed_data:
-                            broadcast_results(parsed_data, group_name="Live Results")
-                            
-            except Exception as error:
-                print("Error captured:", error)
-                time.sleep(5)
+    return out
 
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            time.sleep(10)
 
-if __name__ == "__main__":
-    main()
+def report(results):
+    vals = [x["multiplier"] for x in results]
+
+    if not vals:
+        return "ما في نتائج مفهومة ضمن رد API."
+
+    lines = ["📊 نتائج Aviator:"]
+
+    for i, x in enumerate(results[-20:], 1):
+        stamp = (
+            f" — {x['timestamp']}"
+            if x.get("timestamp")
+            else ""
+        )
+
+        lines.append(
+            f"{i}. {x['multiplier']:.2f}x{stamp}"
+        )
+
+    lines += [
+        "",
+        f"عدد النتائج: {len(vals)}",
+        f"المتوسط: {statistics.mean(vals):.2f}x",
+        f"الوسيط: {statistics.median(vals):.2f}x",
+        (
+            f"أقل من 2x: "
+            f"{sum(v < 2 for v in vals)} "
+            f"({sum(v < 2 for v in vals) / len(vals) * 100:.1f}%)"
+        ),
+        "",
+        "تنبيه: النتائج السابقة لا تضمن نتيجة الجولة القادمة."
+    ]
+
+    return "\n".join(lines)
+
+
+def fetch():
+    if not DOMAIN or not SPIN_TOKEN:
+        raise RuntimeError(
+            "مصدر Spinmama غير مضبوط. "
+            "نحتاج API رسمي ورمز وصول صحيح."
+        )
+
+    # استخدم هذا العنوان فقط إذا أكدت Spinmama أنه رسمي.
+    r = http.get(
+        DOMAIN + "/outcomes",
+        headers={
+            "Authorization": f"Bearer {SPIN_TOKEN}",
+            "Accept": "application/json"
+        },
+        timeout=20
+    )
+
+    r.raise_for_status()
+    return extract(r.json())
+
+
+def handle(update):
+    msg = update.get("message") or update.get("edited_message")
+
+    if not msg:
+        return
+
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not chat_id or not text:
+        return
+
+    cmd = text.split()[0].split("@")[0].lower()
+
+    if cmd in ("/start", "/help"):
+        send(
+            chat_id,
+            "أ
